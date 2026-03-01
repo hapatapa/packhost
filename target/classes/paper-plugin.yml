@@ -1,0 +1,17 @@
+name: PackHost
+version: 1.0-SNAPSHOT
+main: com.hapatapa.packhost.PackHostPlugin
+api-version: '1.21'
+description: Self-hosted resource pack library plugin for Minecraft. Serves ZIPs via a built-in HTTP server and sends packs to clients using the Adventure API.
+
+dependencies:
+  server:
+    ProtocolLib:
+      load: BEFORE
+      required: false
+
+commands:
+  packhost:
+    description: PackHost diagnostic command
+    permission: packhost.admin
+    usage: /packhost status

@@ -1,0 +1,14 @@
+# PackHost Configuration
+
+# Network interface to bind the HTTP server to.
+# Use 0.0.0.0 to listen on all interfaces.
+host: 0.0.0.0
+
+# Port for the embedded HTTP server.
+port: 8080
+
+# The URL that clients (players) will use to download resource packs.
+# If left blank, PackHost will auto-detect using the server's IP and the port above.
+# Override this when running behind a reverse proxy, NAT, or a different domain.
+# Example: https://play.myserver.com:8080
+public-address: ""
