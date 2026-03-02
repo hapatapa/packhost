@@ -10,8 +10,8 @@ dependencies:
       load: BEFORE
       required: false
 
-commands:
-  packhost:
-    description: PackHost diagnostic command
-    permission: packhost.admin
-    usage: /packhost status
+dependencies:
+  server:
+    ProtocolLib:
+      load: BEFORE
+      required: false

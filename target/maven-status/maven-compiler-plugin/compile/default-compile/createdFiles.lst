@@ -1,6 +1,7 @@
 com/hapatapa/packhost/PackReadyEvent.class
 com/hapatapa/packhost/PackHttpServer.class
 com/hapatapa/packhost/PackHostAPI.class
+com/hapatapa/packhost/PackHostPlugin$1.class
 com/hapatapa/packhost/PackEntry.class
 com/hapatapa/packhost/PackHostPlugin.class
 com/hapatapa/packhost/PackOrderConfig.class

@@ -52,6 +52,22 @@ public final class PackHostAPI {
     }
 
     /**
+     * Register a resource pack from a byte array of ZIP data (generated at
+     * runtime).
+     *
+     * @param caller    The calling plugin
+     * @param label     A human-readable label for this pack (used in
+     *                  pack_order.json)
+     * @param zipBytes  The byte array containing the ZIP file data
+     * @param earlyLoad {@code true} → required at login; {@code false} → on-demand
+     * @param onReady   Called (on an async thread) when the pack is serving.
+     */
+    public static void registerRuntimePack(JavaPlugin caller, String label, byte[] zipBytes,
+            boolean earlyLoad, Consumer<PackEntry> onReady) {
+        PackHostPlugin.getInstance().registerRuntimePack(caller, label, zipBytes, earlyLoad, onReady);
+    }
+
+    /**
      * Build an Adventure {@link ResourcePackRequest} containing all early-load
      * packs
      * (plugin packs registered with {@code earlyLoad=true} plus all custom packs),

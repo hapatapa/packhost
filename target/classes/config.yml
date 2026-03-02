@@ -12,3 +12,9 @@ port: 8080
 # Override this when running behind a reverse proxy, NAT, or a different domain.
 # Example: https://play.myserver.com:8080
 public-address: ""
+
+# Secondary URL for resource pack downloads.
+# If the primary URL fails, PackHost will retry with this address.
+# Useful for local network players if the public address is unreachable.
+# If left blank, PackHost will try to auto-detect the local LAN IP.
+fallback-address: ""

@@ -9,8 +9,13 @@ import org.bukkit.event.EventHandler;
 import org.bukkit.event.Listener;
 import org.bukkit.event.player.PlayerJoinEvent;
 import org.bukkit.event.player.PlayerResourcePackStatusEvent;
+import io.papermc.paper.event.connection.configuration.AsyncPlayerConnectionConfigureEvent;
 import org.bukkit.plugin.java.JavaPlugin;
 import org.jetbrains.annotations.NotNull;
+
+import io.papermc.paper.command.brigadier.BasicCommand;
+import io.papermc.paper.command.brigadier.CommandSourceStack;
+import io.papermc.paper.plugin.lifecycle.event.types.LifecycleEvents;
 
 import java.io.*;
 import java.net.InetAddress;
@@ -50,7 +55,13 @@ public class PackHostPlugin extends JavaPlugin implements Listener {
     private volatile boolean registrationPhaseComplete = false;
 
     private String publicAddress;
+    private String localFallbackAddress;
     private PackOrderConfig orderConfig;
+
+    /**
+     * Players who have already attempted the local IP fallback during this session.
+     */
+    private final Set<UUID> fallbackTried = Collections.synchronizedSet(new HashSet<>());
 
     // -------------------------------------------------------------------------
     // Lifecycle
@@ -65,25 +76,43 @@ public class PackHostPlugin extends JavaPlugin implements Listener {
         String host = getConfig().getString("host", "0.0.0.0");
         int port = getConfig().getInt("port", 8080);
         publicAddress = getConfig().getString("public-address", "").trim();
+        String fallbackAddressConfig = getConfig().getString("fallback-address", "").trim();
+
+        if (!publicAddress.isEmpty() && !publicAddress.startsWith("http://") && !publicAddress.startsWith("https://")) {
+            publicAddress = "http://" + publicAddress;
+        }
+
+        if (!fallbackAddressConfig.isEmpty() && !fallbackAddressConfig.startsWith("http://")
+                && !fallbackAddressConfig.startsWith("https://")) {
+            fallbackAddressConfig = "http://" + fallbackAddressConfig;
+        }
 
         // Start HTTP server
         try {
             httpServer.start(host, port);
-            if (publicAddress.isEmpty()) {
-                String ip = getServer().getIp();
-                if (ip == null || ip.isEmpty() || ip.equals("0.0.0.0")) {
-                    // Try to get actual local IP by connecting to a dummy socket
-                    try (java.net.DatagramSocket socket = new java.net.DatagramSocket()) {
-                        socket.connect(InetAddress.getByName("8.8.8.8"), 10002);
-                        ip = socket.getLocalAddress().getHostAddress();
-                    } catch (Exception ignored) {
-                        ip = "localhost";
-                    }
+
+            if (!fallbackAddressConfig.isEmpty()) {
+                localFallbackAddress = fallbackAddressConfig;
+            } else {
+                // Auto-detect local IP for fallback
+                String detectedIp;
+                try (java.net.DatagramSocket socket = new java.net.DatagramSocket()) {
+                    socket.connect(InetAddress.getByName("8.8.8.8"), 10002);
+                    detectedIp = socket.getLocalAddress().getHostAddress();
+                } catch (Exception ignored) {
+                    detectedIp = "localhost";
                 }
-                publicAddress = "http://" + ip + ":" + port;
+                localFallbackAddress = "http://" + detectedIp + ":" + port;
             }
+
+            if (publicAddress.isEmpty()) {
+                publicAddress = localFallbackAddress;
+            }
+
             getLogger().info("HTTP server started on " + host + ":" + port
-                    + "  |  public address: " + publicAddress);
+                    + "  |  public address: " + publicAddress
+                    + "  |  local fallback: " + localFallbackAddress);
+
             if (publicAddress.contains("localhost")) {
                 getLogger().warning(
                         "Public address is set to 'localhost'. External players will NOT be able to download packs!");
@@ -99,6 +128,16 @@ public class PackHostPlugin extends JavaPlugin implements Listener {
         // Register listeners
         getServer().getPluginManager().registerEvents(this, this);
         getServer().getPluginManager().registerEvents(new LoginHoldListener(this), this);
+
+        // Register command using Paper's Lifecycle API
+        getLifecycleManager().registerEventHandler(LifecycleEvents.COMMANDS, event -> {
+            event.registrar().register("packhost", "PackHost diagnostic command", List.of(), new BasicCommand() {
+                @Override
+                public void execute(@NotNull CommandSourceStack stack, @NotNull String[] args) {
+                    onPackHostCommand(stack.getSender(), args);
+                }
+            });
+        });
 
         // Scan custom_packs/ — all custom packs are early + required
         File customPacksDir = new File(getDataFolder(), "custom_packs");
@@ -196,6 +235,52 @@ public class PackHostPlugin extends JavaPlugin implements Listener {
     }
 
     /**
+     * Registers a pack from a byte array of ZIP data (generated at runtime).
+     */
+    public void registerRuntimePack(JavaPlugin caller, String label, byte[] zipBytes,
+            boolean earlyLoad, Consumer<PackEntry> onReady) {
+        if (earlyLoad) {
+            pendingEarlyPacks.incrementAndGet();
+        }
+
+        getServer().getScheduler().runTaskAsynchronously(this, () -> {
+            try {
+                // Deterministic UUID from plugin name + label
+                UUID id = UUID.nameUUIDFromBytes((caller.getName() + ":" + label).getBytes());
+
+                getLogger().info("Registering runtime pack [" + label + "] from plugin " + caller.getName());
+
+                // Compute SHA-1
+                String sha1 = sha1Hex(zipBytes);
+
+                // Register with HTTP server
+                httpServer.registerPack(id, zipBytes);
+                String url = publicAddress + "/packs/" + id + ".zip";
+
+                PackEntry entry = new PackEntry(id, URI.create(url), sha1, label, earlyLoad);
+                registeredPacks.add(entry);
+
+                getLogger().info("Registered runtime pack: [" + label + "] url=" + url + " sha1=" + sha1);
+
+                if (onReady != null) {
+                    onReady.accept(entry);
+                }
+            } catch (Exception e) {
+                getLogger().warning("Failed to register runtime pack '" + label + "' from plugin '" + caller.getName()
+                        + "': " + e.getMessage());
+                e.printStackTrace();
+            } finally {
+                if (earlyLoad) {
+                    int remaining = pendingEarlyPacks.decrementAndGet();
+                    if (remaining == 0 && registrationPhaseComplete) {
+                        onAllEarlyPacksHashed();
+                    }
+                }
+            }
+        });
+    }
+
+    /**
      * Registers a ZIP file dropped into custom_packs/ — always early + required.
      */
     private void registerCustomPack(File zip) {
@@ -250,32 +335,73 @@ public class PackHostPlugin extends JavaPlugin implements Listener {
     // -------------------------------------------------------------------------
 
     @EventHandler
+    public void onConfiguration(AsyncPlayerConnectionConfigureEvent event) {
+        // In 1.21+, the Configuration phase is the ideal time to send resource packs.
+        ResourcePackRequest request = buildEarlyRequest();
+        if (request != null) {
+            String name = event.getConnection().getProfile().getName();
+            if (name == null)
+                name = "Unknown";
+            getLogger().info("Negotiating early pack bundle with " + name + " ("
+                    + request.packs().size() + " packs) during Configuration phase.");
+            event.getConnection().getAudience().sendResourcePacks(request);
+        } else {
+            String name = event.getConnection().getProfile().getName();
+            if (name == null)
+                name = "Unknown";
+            getLogger().info("No early packs to negotiate with " + name
+                    + " (Status: Ready=" + earlyPacksReady.get() + ", Count=" + registeredPacks.size() + ")");
+        }
+    }
+
+    @EventHandler
     public void onPlayerJoin(PlayerJoinEvent event) {
-        // Send early packs to joining players with a 20-tick delay to ensure client is
-        // ready
+        // We still keep the join fallback just in case, but usually Configuration phase
+        // handles it.
         Player player = event.getPlayer();
         getServer().getScheduler().runTaskLater(this, () -> {
             if (!player.isOnline())
                 return;
+            // If the player already accepted/declined during configuration, this is a
+            // no-op.
             ResourcePackRequest request = buildEarlyRequest();
             if (request != null) {
-                getLogger().info("Sending early pack bundle to " + player.getName() + " (" + request.packs().size()
-                        + " packs)");
+                getLogger().info("Sending early pack bundle check to " + player.getName());
                 player.sendResourcePacks(request);
-            } else {
-                getLogger().info("No early packs to send to " + player.getName());
             }
-        }, 20L); // 1 second delay
+        }, 100L); // 5 second delay for join fallback
     }
 
     @EventHandler
     public void onPackStatus(PlayerResourcePackStatusEvent event) {
-        getLogger().info("[PackStatus] " + event.getPlayer().getName() + ": " + event.getStatus());
+        Player player = event.getPlayer();
+        getLogger().info("[PackStatus] " + player.getName() + ": " + event.getStatus());
+
+        if (event.getStatus() == PlayerResourcePackStatusEvent.Status.FAILED_DOWNLOAD) {
+            if (fallbackTried.add(player.getUniqueId())) {
+                getLogger().warning("Pack download FAILED for " + player.getName()
+                        + ". Retrying with local IP fallback: " + localFallbackAddress);
+
+                ResourcePackRequest fallbackRequest = buildFallbackRequest();
+                if (fallbackRequest != null) {
+                    // Slight delay to ensure client is ready for another request
+                    getServer().getScheduler().runTaskLater(this, () -> {
+                        if (player.isOnline()) {
+                            player.sendResourcePacks(fallbackRequest);
+                        }
+                    }, 20L);
+                }
+            } else {
+                getLogger().severe("Pack download FAILED again for " + player.getName()
+                        + " even with local IP fallback. Giving up.");
+            }
+        } else if (event.getStatus() == PlayerResourcePackStatusEvent.Status.SUCCESSFULLY_LOADED) {
+            // Cleanup on success
+            fallbackTried.remove(player.getUniqueId());
+        }
     }
 
-    @Override
-    public boolean onCommand(@NotNull CommandSender sender, @NotNull Command command, @NotNull String label,
-            @NotNull String[] args) {
+    private void onPackHostCommand(CommandSender sender, String[] args) {
         if (args.length > 0) {
             if (args[0].equalsIgnoreCase("status")) {
                 sender.sendMessage("§e--- PackHost Status ---");
@@ -286,19 +412,27 @@ public class PackHostPlugin extends JavaPlugin implements Listener {
                     sender.sendMessage("§8- §f" + entry.getLabel() + " §7(Early: " + entry.isEarlyLoad() + ", Id: "
                             + entry.getId() + ")");
                 }
-                return true;
             } else if (args[0].equalsIgnoreCase("send") && sender instanceof Player player) {
                 ResourcePackRequest request = buildEarlyRequest();
                 if (request != null) {
-                    player.sendMessage("§aAttempting to send resource pack bundle...");
+                    player.sendMessage(
+                            "§aAttempting to send resource pack bundle (" + request.packs().size() + " packs)...");
                     player.sendResourcePacks(request);
                 } else {
                     player.sendMessage("§cNo early packs found to send.");
                 }
-                return true;
+            } else if (args[0].equalsIgnoreCase("force-ready")) {
+                onAllEarlyPacksHashed();
+                sender.sendMessage("§aForce-triggered ready state.");
             }
         }
-        return false;
+    }
+
+    @Override
+    public boolean onCommand(@NotNull CommandSender sender, @NotNull Command command, @NotNull String label,
+            @NotNull String[] args) {
+        onPackHostCommand(sender, args);
+        return true;
     }
 
     /**
@@ -321,14 +455,53 @@ public class PackHostPlugin extends JavaPlugin implements Listener {
                                     .build());
                 });
 
-        if (infos.isEmpty())
+        if (infos.isEmpty()) {
+            getLogger().warning("buildEarlyRequest() returning null (no early packs registered!)");
             return null;
+        }
 
+        getLogger().info("Built early pack request with " + infos.size() + " packs.");
         return ResourcePackRequest.resourcePackRequest()
                 .packs(infos)
                 .required(true)
                 .replace(false)
                 .prompt(net.kyori.adventure.text.Component.text("This server uses custom resource packs."))
+                .build();
+    }
+
+    /**
+     * Builds an Adventure ResourcePackRequest containing all early-load packs,
+     * but using the local fallback address instead of the public address.
+     */
+    public ResourcePackRequest buildFallbackRequest() {
+        List<ResourcePackInfo> infos = new ArrayList<>();
+
+        registeredPacks.stream()
+                .filter(PackEntry::isEarlyLoad)
+                .sorted(Comparator.comparingInt(PackEntry::getIndex))
+                .forEach(e -> {
+                    // Swap public address with local fallback address
+                    String originalUrl = e.getUrl().toString();
+                    String fallbackUrl = originalUrl.replace(publicAddress, localFallbackAddress);
+
+                    getLogger().info("Adding fallback pack to bundle: " + e.getLabel() + " | URL: " + fallbackUrl);
+                    infos.add(
+                            ResourcePackInfo.resourcePackInfo()
+                                    .id(e.getId())
+                                    .uri(URI.create(fallbackUrl))
+                                    .hash(e.getSha1())
+                                    .build());
+                });
+
+        if (infos.isEmpty()) {
+            return null;
+        }
+
+        return ResourcePackRequest.resourcePackRequest()
+                .packs(infos)
+                .required(true)
+                .replace(false)
+                .prompt(net.kyori.adventure.text.Component.text("Retrying resource pack download via local network..."))
                 .build();
     }
 
