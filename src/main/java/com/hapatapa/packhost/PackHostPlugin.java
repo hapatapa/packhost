@@ -63,6 +63,11 @@ public class PackHostPlugin extends JavaPlugin implements Listener {
      */
     private final Set<UUID> fallbackTried = Collections.synchronizedSet(new HashSet<>());
 
+    /**
+     * Players who have successfully loaded the early resource pack bundle.
+     */
+    private final Set<UUID> loadedEarlyPacks = Collections.synchronizedSet(new HashSet<>());
+
     // -------------------------------------------------------------------------
     // Lifecycle
     // -------------------------------------------------------------------------
@@ -362,14 +367,28 @@ public class PackHostPlugin extends JavaPlugin implements Listener {
         getServer().getScheduler().runTaskLater(this, () -> {
             if (!player.isOnline())
                 return;
-            // If the player already accepted/declined during configuration, this is a
-            // no-op.
+
+            // If the player already loaded during configuration, this is a no-op.
+            if (loadedEarlyPacks.contains(player.getUniqueId())) {
+                getLogger().info("Skipping redundant join-phase pack send for " + player.getName()
+                        + " (already loaded during Configuration)");
+                return;
+            }
+
             ResourcePackRequest request = buildEarlyRequest();
             if (request != null) {
-                getLogger().info("Sending early pack bundle check to " + player.getName());
+                getLogger().info("Sending early pack bundle check to " + player.getName() + " (Join Fallback)");
                 player.sendResourcePacks(request);
             }
         }, 100L); // 5 second delay for join fallback
+    }
+
+    @EventHandler
+    public void onPlayerQuit(org.bukkit.event.player.PlayerQuitEvent event) {
+        // Cleanup tracking sets to prevent memory leaks
+        UUID id = event.getPlayer().getUniqueId();
+        fallbackTried.remove(id);
+        loadedEarlyPacks.remove(id);
     }
 
     @EventHandler
@@ -398,6 +417,8 @@ public class PackHostPlugin extends JavaPlugin implements Listener {
         } else if (event.getStatus() == PlayerResourcePackStatusEvent.Status.SUCCESSFULLY_LOADED) {
             // Cleanup on success
             fallbackTried.remove(player.getUniqueId());
+            loadedEarlyPacks.add(player.getUniqueId());
+            getLogger().info("Marked early packs as LOADED for " + player.getName());
         }
     }
 
